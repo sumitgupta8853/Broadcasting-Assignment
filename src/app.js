@@ -65,6 +65,22 @@ app.use((err, req, res, next) => {
   return errorResponse(res, err.message || 'Internal server error.', err.statusCode || 500);
 });
 
+app.get('/debug', async (req, res) => {
+  const { query } = require('./config/database');
+  try {
+    const result = await query('SELECT tablename FROM pg_tables WHERE schemaname=$1', ['public']);
+    res.json({
+      DATABASE_URL: process.env.DATABASE_URL ? 'SET' : 'NOT SET',
+      tables: result.rows,
+    });
+  } catch (err) {
+    res.json({
+      DATABASE_URL: process.env.DATABASE_URL ? 'SET' : 'NOT SET',
+      error: err.message,
+    });
+  }
+});
+
 // ─────────────────────────────────────────────
 // Start Server
 // ─────────────────────────────────────────────
