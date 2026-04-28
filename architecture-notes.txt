@@ -1,0 +1,228 @@
+========================================================
+ CONTENT BROADCASTING SYSTEM — ARCHITECTURE NOTES
+========================================================
+
+1. AUTHENTICATION & RBAC FLOW
+───────────────────────────────
+Flow:
+  Client → POST /auth/login → { JWT token }
+  Client → [Protected Route] with Header: Authorization: Bearer <token>
+  Server → auth.middleware.js → verifyToken(token) → decode { id, role }
+  Server → DB: SELECT user by id (live check, not stale token info)
+  Server → authorize('principal') or authorize('teacher') middleware check
+
+Why JWT:
+  - Stateless: no server-side session store needed
+  - Role embedded in token payload but re-validated against DB on every request
+    to prevent stale role data after role changes
+
+RBAC Enforcement:
+  - authenticate()  → validates JWT, populates req.user
+  - authorize(...roles) → checks req.user.role against allowed roles
+  - Principal: approve/reject content, view all content, view all teachers
+  - Teacher: upload content, view own content, view own schedule
+
+Principal and Teacher permissions are strictly separated at the middleware
+layer — a teacher cannot call principal endpoints even with a valid token.
+
+2. SUBJECT-BASED SYSTEM DESIGN
+────────────────────────────────
+Each teacher × subject combination forms a "content slot" (content_slots table).
+  - e.g., teacher-1 + "maths" = one slot
+  - e.g., teacher-1 + "science" = another slot
+
+Each slot has an ordered list of content items with individual durations
+(content_schedule table). This design allows:
+  - Subject-level independence: Maths rotation doesn't affect Science rotation
+  - Per-teacher isolation: teacher-1's Maths is separate from teacher-2's Maths
+  - Fine-grained control: each content item has its own rotation_duration
+
+3. UPLOAD HANDLING APPROACH
+─────────────────────────────
+Library: Multer (disk storage)
+
+Steps:
+  1. Multer fileFilter validates MIME type (image/jpeg, image/png, image/gif)
+     AND file extension (.jpg, .jpeg, .png, .gif) — double validation to
+     prevent MIME spoofing.
+  2. File is saved to /src/uploads/<uuid>.<ext> on disk.
+  3. DB record stores both:
+     - file_path (absolute path for server-side reading)
+     - file_url  (public URL for client-side access)
+  4. Files served statically via Express: GET /uploads/<filename>
+  5. Max size: 10MB enforced by Multer's limits.fileSize
+
+On rejection or error, the partially uploaded file may remain on disk.
+In production, a cleanup job or S3 lifecycle policy would handle orphans.
+
+Bonus / S3 Extension:
+  Replace Multer diskStorage with multer-s3.
+  file_url becomes the S3 signed URL; file_path becomes the S3 key.
+  No other code changes needed — the service layer is storage-agnostic.
+
+4. APPROVAL WORKFLOW DESIGN
+─────────────────────────────
+State machine: uploaded → pending → approved | rejected
+
+  [Teacher uploads]  → status = 'pending'
+  [Principal approves] → status = 'approved', approved_by = principal.id, approved_at = NOW()
+  [Principal rejects]  → status = 'rejected', rejection_reason = <reason>
+
+Rules enforced:
+  - Only content in 'pending' state can be reviewed (409 if already reviewed)
+  - Rejection MUST include a rejection_reason (validated at middleware level)
+  - Only users with role = 'principal' can call the review endpoint (403 otherwise)
+  - Rejected content's reason is visible to teachers in GET /content/:id
+
+Even after approval, content only broadcasts if it is within its active
+time window (see Scheduling Logic below).
+
+5. SCHEDULING / ROTATION LOGIC (VERY IMPORTANT)
+──────────────────────────────────────────────────
+Design goals:
+  - Stateless: no background jobs or cron needed
+  - Deterministic: same query at same time always returns same content
+  - Subject-independent: Maths and Science rotate independently
+  - Looping: rotation wraps around after all items have shown
+
+Algorithm (in scheduling.service.js → getActiveContentForSubject):
+
+  Step 1 — Filter eligible content
+    Only content that is:
+      ✓ status = 'approved'
+      ✓ start_time IS NOT NULL and end_time IS NOT NULL
+      ✓ NOW() >= start_time  (has started)
+      ✓ NOW() <= end_time    (not yet expired)
+    is considered for rotation.
+
+  Step 2 — Group by subject (within teacher scope)
+    Each subject's items form an independent rotation group, ordered by
+    rotation_order in the content_schedule table.
+
+  Step 3 — Epoch-anchor rotation (for each subject group)
+    anchor       = MIN(start_time) across all items in the group [in ms]
+    totalCycleMs = SUM(item.duration * 60 * 1000) for all items
+    elapsed      = (NOW_ms - anchor) % totalCycleMs
+
+    Walk through rotation order, accumulating durations:
+      cursor = 0
+      for each item in rotation_order:
+        if elapsed >= cursor AND elapsed < cursor + item.durationMs:
+          → this item is ACTIVE
+        cursor += item.durationMs
+
+  Why epoch-anchor?
+    - No need to store "last shown" state in the DB
+    - Naturally loops (modulo arithmetic)
+    - Works correctly even if the server restarts or scales horizontally
+    - All instances compute the same result for the same timestamp
+
+  Example:
+    Subject: Maths | Teacher: teacher-1 | anchor = 12:00:00
+    Content A: duration 5 min → occupies 0:00 – 5:00 in cycle
+    Content B: duration 5 min → occupies 5:00 – 10:00 in cycle
+    Content C: duration 5 min → occupies 10:00 – 15:00 in cycle
+    Total cycle = 15 min
+
+    At 12:07:30 → elapsed = 7m30s → Content B is active
+    At 12:16:00 → elapsed = 16m % 15m = 1m → Content A is active (loop)
+
+6. DATABASE DESIGN DECISIONS
+──────────────────────────────
+Tables:
+  users           → stores principals and teachers (role column discriminates)
+  content         → core content table; includes scheduling hints (start_time,
+                    end_time, rotation_duration) directly on the row
+  content_slots   → represents a teacher+subject slot (unique constraint ensures
+                    one slot per teacher per subject)
+  content_schedule → maps content to its slot with rotation_order and duration;
+                    UNIQUE(slot_id, rotation_order) ensures no two items share
+                    the same position in rotation
+
+Key decisions:
+  - UUIDs as PKs: avoids sequential ID enumeration in public URLs
+  - TIMESTAMPTZ for all datetimes: timezone-aware, no DST bugs
+  - Soft lifecycle via status enum: content is never deleted, always auditable
+  - FK cascades: deleting a teacher removes their content and schedule entries
+  - Indexes on (uploaded_by, status, subject) for fast filtering
+
+Normalization:
+  - content_slots + content_schedule decouple the "what to show" (content)
+    from "when and in what order to show it" (schedule). This allows the
+    same content to potentially appear in multiple rotation slots in future.
+
+7. FOLDER STRUCTURE
+────────────────────
+src/
+├── app.js                    → Express entry point, global middleware, route mounting
+├── config/
+│   └── database.js           → PostgreSQL pool configuration
+├── controllers/
+│   ├── auth.controller.js    → Register, Login, Profile
+│   ├── content.controller.js → Upload, List, Get, Review, Live, Schedule
+│   └── user.controller.js    → List teachers, teacher content
+├── middlewares/
+│   ├── auth.middleware.js    → JWT authentication + RBAC authorize()
+│   ├── upload.middleware.js  → Multer config, file type/size validation
+│   └── validation.middleware.js → Request body validation
+├── models/                   → (Reserved for ORM models if migrating to Sequelize/Prisma)
+├── routes/
+│   ├── auth.routes.js
+│   ├── content.routes.js
+│   └── user.routes.js
+├── services/
+│   ├── auth.service.js       → Business logic for auth
+│   ├── content.service.js    → Upload, CRUD, approval logic
+│   └── scheduling.service.js → Core rotation/scheduling algorithm
+├── utils/
+│   ├── jwt.js                → Token generation and verification
+│   ├── migrate.js            → DB schema creation script
+│   ├── response.js           → Standardized JSON response helpers
+│   └── seed.js               → Demo data seeder
+└── uploads/                  → Local file storage (gitignored)
+
+8. MIDDLEWARE USAGE
+─────────────────────
+Request lifecycle for a protected content upload:
+
+  POST /content/upload
+    │
+    ├─ cors()                        → CORS headers
+    ├─ express.json()                → Parse body
+    ├─ authenticate()                → JWT verify + DB user fetch → req.user
+    ├─ authorize('teacher')          → Role check
+    ├─ upload.single('file')         → Multer: save file to disk
+    ├─ handleUploadError()           → Multer error → clean JSON error
+    ├─ validateContentUpload()       → Body validation (title, subject, times)
+    └─ contentController.upload()   → Business logic
+
+9. SCALABILITY APPROACH
+─────────────────────────
+Caching (Bonus — Redis):
+  The GET /content/live/:teacherId endpoint is the hottest path (all students
+  hit it constantly). With Redis:
+    key: "live:<teacherId>:<subject>"
+    TTL: 60 seconds (or = remaining time in current slot, for precision)
+    Cache-aside pattern: check Redis → if miss, compute → write to Redis
+  This reduces DB load from O(students) to O(teachers).
+
+Rate Limiting (implemented via express-rate-limit):
+  - /content/live → 60 req/min per IP
+  - /auth/* → 20 req/15min per IP (brute-force protection)
+
+Horizontal Scaling:
+  - Stateless JWT auth → no sticky sessions needed
+  - Epoch-based scheduling is deterministic → any instance gives same answer
+  - File uploads: switch from local disk to S3 for shared storage across pods
+  - DB: use connection pooling (pg Pool); add read replicas for live endpoint
+
+Queue-based Approval Notifications (future):
+  When principal approves content, publish an event to a message queue
+  (e.g., Bull/Redis or SQS). Workers can send push notifications to teachers,
+  warm the cache, etc. — without blocking the HTTP response.
+
+Database:
+  - Current: Single PostgreSQL instance
+  - Scale: Add read replica; route SELECT queries to replica
+  - Partitioning: content table can be partitioned by status for faster queries
+========================================================
