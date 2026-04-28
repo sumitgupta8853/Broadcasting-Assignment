@@ -11,17 +11,10 @@ const { errorResponse } = require('./utils/response');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-
-
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-
 const publicLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, 
   max: 60,
@@ -29,7 +22,6 @@ const publicLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
-
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, 
